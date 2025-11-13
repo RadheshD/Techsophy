@@ -1,0 +1,215 @@
+import asyncio
+import time
+import math
+import random
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor, IsolationForest
+from sklearn.metrics import mean_absolute_error
+import logging
+
+# ---------------- Basic setup ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S"
+)
+
+# ---------------- Configurations ----------------
+class Config:
+    # These are some tuning values for the autoscaler
+    TARGET_RPS_PER_REPLICA = 50  # each replica can handle this much RPS
+    MIN_REPLICAS = 1
+    MAX_REPLICAS = 20
+    SCALE_UP_STEP = 3
+    SCALE_DOWN_STEP = 2
+    SCALE_UP_COOLDOWN = 60       # seconds
+    SCALE_DOWN_COOLDOWN = 120
+    ANOMALY_WINDOW = 60          # how much data to check for anomaly
+    SAMPLE_FREQ = 1              # 1 minute
+    PRED_HORIZON = 3             # predict next 3 minutes
+
+
+# ---------------- Monitor ----------------
+class Monitor:
+    """This class just makes some fake data like RPS (Requests per second)."""
+    def __init__(self, seed=42):
+        random.seed(seed)
+        self.data = self._generate_fake_data(24 * 60)  # 1 day = 1440 mins
+
+    def _generate_fake_data(self, minutes):
+        # make some sine pattern like day-night usage pattern
+        t = np.arange(minutes)
+        pattern = 40 + 25 * np.sin(2 * np.pi * t / (24 * 60))
+        noise = np.random.normal(0, 4, size=minutes)
+
+        spikes = np.zeros_like(t, dtype=float)
+        for _ in range(6):  # add few random spikes
+            c = random.randint(0, minutes - 1)
+            spikes += random.randint(30, 70) * np.exp(-0.5 * ((t - c) / 4) ** 2)
+
+        rps = np.clip(pattern + noise + spikes, 0, None)
+        df = pd.DataFrame({"rps": rps})
+        df.index = pd.date_range(end=pd.Timestamp.now(), periods=minutes, freq="1min")
+        return df
+
+    async def collect(self):
+        """Returns latest few RPS values."""
+        await asyncio.sleep(0.1)
+        latest = self.data.tail(5)["rps"]
+        avg_rps = float(latest.mean())
+        print(f"[Monitor] Current Avg RPS: {avg_rps:.2f}")
+        return {
+            "timestamp": latest.index[-1],
+            "rps": avg_rps,
+            "raw_series": latest
+        }
+
+
+# ---------------- Forecaster ----------------
+class Forecaster:
+    """This will predict what might happen next (next few RPS values)."""
+    def __init__(self):
+        self.model = GradientBoostingRegressor(random_state=42)
+
+    def train(self, series: pd.Series):
+        df = pd.DataFrame({"y": series})
+        # creating lag features
+        df["lag1"] = df["y"].shift(1)
+        df["lag2"] = df["y"].shift(2)
+        df["lag3"] = df["y"].shift(3)
+        df["target"] = df["y"].shift(-1)
+        df = df.dropna()
+
+        X = df[["lag1", "lag2", "lag3"]]
+        y = df["target"]
+
+        split = int(len(X) * 0.8)
+        X_train, X_test = X.iloc[:split], X.iloc[split:]
+        y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+        self.model.fit(X_train, y_train)
+        preds = self.model.predict(X_test)
+        mae = mean_absolute_error(y_test, preds)
+        print(f"[Forecaster] Model trained successfully. MAE = {mae:.2f}")
+
+    def predict(self, series: pd.Series):
+        preds = []
+        s = list(series[-3:])
+        for _ in range(Config.PRED_HORIZON):
+            X = np.array(s[-3:]).reshape(1, -1)
+            next_val = float(self.model.predict(X)[0])
+            preds.append(next_val)
+            s.append(next_val)
+        print(f"[Forecaster] Next {Config.PRED_HORIZON} min prediction: {preds}")
+        return preds
+
+
+# ---------------- Anomaly Detector ----------------
+class AnomalyDetector:
+    """This checks if a sudden spike or drop has happened."""
+    def __init__(self):
+        self.detector = IsolationForest(contamination=0.01, random_state=42)
+
+    def fit(self, series: pd.Series):
+        self.detector.fit(series.values.reshape(-1, 1))
+        print("[AnomalyDetector] Trained on recent data")
+
+    def is_anomaly(self, value: float) -> bool:
+        pred = self.detector.predict(np.array([[value]]))[0]
+        if pred == -1:
+            print(f"[AnomalyDetector] 🚨 Anomaly Detected! Value = {value}")
+            return True
+        return False
+
+
+# ---------------- Decision Engine ----------------
+class DecisionEngine:
+    """Takes decisions based on forecast and anomaly."""
+    def __init__(self):
+        self.current_replicas = 3
+        self.last_scale_time = 0
+
+    def decide(self, current_rps, forecast, anomaly):
+        target_per_replica = Config.TARGET_RPS_PER_REPLICA
+        predicted = forecast[0] if forecast else current_rps
+        desired = math.ceil(predicted / target_per_replica)
+        desired = max(Config.MIN_REPLICAS, min(Config.MAX_REPLICAS, desired))
+
+        now = time.time()
+
+        # Cooldown check to prevent over-scaling
+        if desired > self.current_replicas and (now - self.last_scale_time < Config.SCALE_UP_COOLDOWN):
+            return self.current_replicas, "cooldown_up"
+        if desired < self.current_replicas and (now - self.last_scale_time < Config.SCALE_DOWN_COOLDOWN):
+            return self.current_replicas, "cooldown_down"
+
+        # Slowly scale up or down
+        if desired > self.current_replicas:
+            new_replicas = self.current_replicas + Config.SCALE_UP_STEP
+            reason = "scale_up"
+        elif desired < self.current_replicas:
+            new_replicas = max(Config.MIN_REPLICAS, self.current_replicas - Config.SCALE_DOWN_STEP)
+            reason = "scale_down"
+        else:
+            new_replicas = self.current_replicas
+            reason = "no_change"
+
+        # If sudden spike detected, add one extra replica
+        if anomaly and new_replicas == self.current_replicas:
+            new_replicas += 1
+            reason = "spike_detected"
+
+        # Update scale time and replicas
+        if new_replicas != self.current_replicas:
+            self.last_scale_time = now
+            self.current_replicas = new_replicas
+
+        print(f"[DecisionEngine] {reason.upper()} → New replica count: {new_replicas}")
+        return new_replicas, reason
+
+
+# ---------------- Executor ----------------
+class Executor:
+    """This is like the system applying the scaling change."""
+    async def apply(self, from_count, to_count, reason):
+        await asyncio.sleep(0.2)
+        print(f"[Executor] Scaling from {from_count} → {to_count} because of {reason}")
+
+
+# ---------------- AutoScaler Orchestrator ----------------
+class AutoScaler:
+    """Main class which connects all the parts together."""
+    def __init__(self):
+        self.monitor = Monitor()
+        self.forecaster = Forecaster()
+        self.detector = AnomalyDetector()
+        self.decision = DecisionEngine()
+        self.executor = Executor()
+
+        # train model and detector
+        self.forecaster.train(self.monitor.data["rps"])
+        self.detector.fit(self.monitor.data.tail(Config.ANOMALY_WINDOW)["rps"])
+
+    async def run_cycle(self):
+        metrics = await self.monitor.collect()
+        rps = metrics["rps"]
+        forecast = self.forecaster.predict(metrics["raw_series"])
+        anomaly = self.detector.is_anomaly(rps)
+
+        new_count, reason = self.decision.decide(rps, forecast, anomaly)
+        await self.executor.apply(self.decision.current_replicas, new_count, reason)
+
+    async def run(self, cycles=10):
+        print("[AutoScaler] Starting demo run...")
+        for i in range(cycles):
+            print(f"\n[Cycle {i+1}] ----------------------------")
+            await self.run_cycle()
+            await asyncio.sleep(2)
+        print("[AutoScaler] Demo completed!")
+
+
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    asyncio.run(AutoScaler().run(cycles=10))
